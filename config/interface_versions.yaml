@@ -1,0 +1,19 @@
+---
+#---------------
+# Model version
+#---------------
+
+Tax-Simulator:
+  type: model_data
+  version: 1
+
+
+#---------------------
+# Dependency versions
+#---------------------
+
+Tax-Data:
+  type: model_data
+  version: 1
+  default_vintage: 2024111117
+  default_id: baseline
