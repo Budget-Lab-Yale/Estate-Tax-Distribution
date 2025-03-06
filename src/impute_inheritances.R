@@ -1,6 +1,89 @@
+#------------------------------------------------------------------------------
+# impute_inheritances.R
+#
+# TODO
+#------------------------------------------------------------------------------
 
 
-scf_w_inheritance = c('2013', '2016', '2019', '2022') %>% 
+#--------------------
+# Process macro data
+#--------------------
+
+# Read macro data
+macro_projections_raw = c('projections.csv', 'historical.csv') %>% 
+  map(
+    .f = ~ input_data_roots$macro_projections %>% 
+      file.path(.x) %>% 
+      read_csv(show_col_types = F) 
+  ) %>% 
+  bind_rows() %>% 
+  arrange(year)
+
+# Create economic dataframe
+macro_projections = list()
+macro_projections$economic = macro_projections_raw %>%  
+  select(year, gdp, cpiu, ccpiu_irs)
+
+# Create demographic dataframe
+macro_projections$demographic = macro_projections_raw %>% 
+  select(year, contains('married')) %>% 
+  pivot_longer(
+    cols      = -year, 
+    names_sep = '_', 
+    names_to  = c('married', 'age'), 
+    values_to = 'population'
+  ) %>%
+  filter(age != 'NA') %>% 
+  mutate(
+    married = as.integer(married == 'married'), 
+    age     = as.integer(age)
+  ) 
+
+# Get historical per-capita net worth from FA 
+net_worth = read_csv('./resources/financial_accounts/b101.csv', show_col_types = F) %>%
+  
+  # Use Q3 given SCF timeframe 
+  mutate(year = as.integer(str_sub(date, 1, 4))) %>% 
+  filter(str_sub(date, 6, 7) == 'Q3', year >= 2013, year <= 2023) %>% 
+  select(year, net_worth = FL152090005.Q) %>% 
+  mutate(net_worth = as.numeric(net_worth)) %>% 
+  
+  # Extend to 2026
+  bind_rows(
+    tibble(year = 2024:2026)
+  ) %>%
+  
+  # Project net worth based on GDP
+  left_join(
+    macro_projections$economic %>% 
+      select(year, gdp), 
+    by = 'year'
+  ) %>% 
+  mutate(
+    net_worth = if_else(
+      year >= 2024, 
+      net_worth[year == 2023] * gdp / gdp[year == 2023], 
+      net_worth
+    )
+  ) %>%
+  
+  # Adjust for population
+  left_join(
+    macro_projections$demographic %>% 
+      group_by(year) %>% 
+      summarise(population = sum(population, na.rm = T)), 
+    by = 'year'
+  ) %>% 
+  mutate(net_worth_pc = net_worth * 1e6 / population) %>%
+  select(year, net_worth_pc)
+
+
+#------------------
+# Process SCF data 
+#------------------
+
+# Load summary extract and join inheritances from detailed file
+scf = c('2013', '2016', '2019', '2022') %>% 
   map(
     .f = function(yr) {
       
@@ -8,24 +91,28 @@ scf_w_inheritance = c('2013', '2016', '2019', '2022') %>%
       yy = str_sub(as.character(yr), -2)
       
       # Read the summary data
-      summary_data = interface_paths$SCF %>% 
-        file.path(paste0('SCFP', yr, '.csv')) %>% 
+      summary_data = input_data_roots$scf %>% 
+        file.path(yr, 'historical', paste0('SCFP', yr, '.csv')) %>% 
         read_csv(show_col_types = F) %>%
         mutate(
-          survey_year = yr, 
+          survey_year = as.integer(yr), 
           married     = as.integer(MARRIED == 1), 
           has_kids    = as.integer(KIDS > 0)
         ) %>%
         select(survey_year, yy1 = YY1, y1 = Y1, weight = WGT, age = AGE, married, has_kids, income = INCOME)
       
-      # Read the detailed data and extract inheritance information
-      detailed_data = interface_paths$SCF %>% 
-        file.path(paste0('p', yy, 'i6.dta')) %>% 
-        read_dta() %>%
-        select(
+      # Read the detailed data and extract inheritance information directly using col_select
+      detailed_data = input_data_roots$scf %>% 
+        file.path(yr, 'historical', paste0('p', yy, 'i6.dta')) %>% 
+        read_dta(col_select = c(
           yy1, y1,
-          
-          # First, second, third inheritances with type, value, and approximate year of receipt
+          x5803, x5804, x5805,
+          x5808, x5809, x5810,
+          x5813, x5814, x5815
+        )) %>%
+        
+        # Rename for first, second, and third inheritances
+        rename(
           type.1 = x5803, value.1 = x5804, year.1 = x5805,
           type.2 = x5808, value.2 = x5809, year.2 = x5810,
           type.3 = x5813, value.3 = x5814, year.3 = x5815
@@ -42,7 +129,7 @@ scf_w_inheritance = c('2013', '2016', '2019', '2022') %>%
 
 
 # Adjust inheritance data to account for the fact that year-received is rounded
-current_year_inheritance = scf_w_inheritance %>% 
+current_year_inheritance = scf %>% 
   select(survey_year, yy1, y1, ends_with('.1'), ends_with('.2'), ends_with('.3')) %>% 
   pivot_longer(
     cols      = c(ends_with('.1'), ends_with('.2'), ends_with('.3')), 
@@ -88,20 +175,13 @@ current_year_inheritance = scf_w_inheritance %>%
     larger_1_2  = if_else(value.1 >= value.2, value.1, value.2), 
     larger_2_3  = if_else(value.2 >= value.3, value.2, value.3),
     inheritance = if_else(larger_1_2 >= larger_2_3, larger_1_2, larger_2_3), 
-    
-    # Deflate inheritances by BlackRock 60/40 ETF price, benchmarked to 2021
-    inheritance = inheritance / case_when(
-      survey_year == 2022 ~ 16.5 / 16.5, 
-      survey_year == 2019 ~ 13.5 / 16.5, 
-      survey_year == 2016 ~ 13.3 / 16.5, 
-      survey_year == 2013 ~ 9.6  / 16.5
-    )
+
   ) %>% 
   select(survey_year, yy1, y1, inheritance) 
 
 
-# Join processed inheritance data
-inheritance_train = scf_w_inheritance %>% 
+# Construct training data
+inheritance_train = scf %>% 
   select(survey_year, yy1, y1, weight, age, married, has_kids, income) %>% 
   left_join(current_year_inheritance, by = c('survey_year', 'yy1', 'y1')) %>% 
   
@@ -111,7 +191,29 @@ inheritance_train = scf_w_inheritance %>%
     has_inheritance = as.integer(inheritance > 0)
   ) %>%
   
-  # Add income percentiles 
+  # Age weights forward to 2026
+  left_join(
+    macro_projections$demographic %>% 
+      group_by(married, age) %>% 
+      mutate(demographic_factor = population[year == 2026] / population) %>% 
+      ungroup() %>% 
+      select(survey_year = year, age, married, demographic_factor), 
+    by = c('survey_year', 'age', 'married')
+  ) %>% 
+  mutate(weight = weight * demographic_factor) %>% 
+  select(-demographic_factor) %>% 
+  
+  # Age inheritance values forward to 2026 
+  left_join(
+    net_worth %>% 
+      mutate(asset_factor = net_worth_pc[year == 2026] / net_worth_pc) %>% 
+      select(survey_year = year, asset_factor), 
+    by = 'survey_year'
+  ) %>% 
+  mutate(inheritance = inheritance * asset_factor) %>% 
+  select(-asset_factor) %>%
+  
+  # Convert income to rank-order space 
   group_by(survey_year) %>%
   mutate(
     income_pctile = cut(
@@ -120,13 +222,18 @@ inheritance_train = scf_w_inheritance %>%
       labels = c(seq(0.01, 0.99, 0.01), seq(0.991, 1, 0.001))
     ) %>% as.character() %>% as.numeric() %>% replace_na(0)
   ) %>% 
-  ungroup() %>%
-  
+  ungroup() %>% 
+  select(-income) %>% 
+
   # Remove billionaire's kid who gives the algorithm a hard time
   filter(inheritance < 300e6)
 
 
-# Estimate models 
+#-----------------------------------
+# Build quantile regression forests 
+#-----------------------------------
+
+# Estimate model for presence of inheritance
 has_inheritance_qrf = quantregForest(
   x        = inheritance_train[c('age', 'married', 'has_kids', 'income_pctile')],
   y        = as.factor(inheritance_train$has_inheritance), 
@@ -137,6 +244,8 @@ has_inheritance_qrf = quantregForest(
   ntree    = 1000
 )
 
+
+# Estimate model of inheritance value conditional on presence
 nonzero_inheritance_train = inheritance_train %>% 
   filter(inheritance > 0)
 inheritance_qrf = quantregForest(
@@ -149,6 +258,16 @@ inheritance_qrf = quantregForest(
   ntree    = 1000
 )
 
+
+#------------------------
+# Fit values on tax data
+#------------------------
+
+# Read tax unit data
+tax_units = input_data_roots$tax_data %>% 
+  file.path('tax_units_2026.csv') %>% 
+  fread() %>% 
+  tibble()
 
 
 # Fit values on tax data
@@ -254,12 +373,6 @@ inheritance_yhat %>%
   )
 
 
-# TODO 
-# -distribution with mean .x, not scalar, for n_heirs 
-#  how are kids distributed?
-# -put in "estate tax model"
-#   - read tax unit data as inputs into distribution from separate coedebase! 
-#   - this way estate tax can be truly exogenous and custom to each scenario!!
 seq(1, 4, 0.2) %>% 
   map(
     ~ inheritance_yhat %>%
