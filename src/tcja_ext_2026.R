@@ -6,6 +6,14 @@
 #------------------------------------------------------------------------------
 
 
+# Simulation targets 
+jct_estimate        = -15               # JCT  https://www.cbo.gov/publication/60114
+rev_tcja            = c(36, 42)         # Jan 2025 CBO revenue outlook
+rev_current_law     = c(51, 57)         # Jan 2025 CBO revenue outlook 
+returns_tcja        = c(3000, 5000)     # 2022 SOI filing year taxable stats + 1000
+returns_current_law = c(9000, 12000)    # Assumption: ~2.5x the TCJA level
+
+
 #--------------------
 # Process macro data
 #--------------------
@@ -393,12 +401,6 @@ do_simulation = function(df, seed, return_microdata = F) {
   # Fit inheritances
   df = fit_inheritances(df, seed)
   
-  # Simulation targets 
-  rev_current_law     = c(51, 57)
-  rev_tcja            = c(36, 42)
-  returns_current_law = c(9000, 12000)
-  returns_tcja        = c(3000, 5000)
-  
   # Calculate taxes and get totals
   tax_totals = df %>%
     expand_grid(
@@ -466,15 +468,12 @@ imputed_values = do_simulation(inheritance_yhat, 8, T)$microdata %>%
     estate_tax.baseline = pmax(0, gross_estate * 2 - 7.2e6) * 0.4 / 2.4, 
     estate_tax.reform   = pmax(0, gross_estate * 2 - 14e6)  * 0.4 / 2.4, 
     estate_tax_change   = estate_tax.reform - estate_tax.baseline
-  )
-
-# Finally rescale to JCT's aggregate estimate
-jct_estimate = -15
-
-imputed_values = imputed_values %>% 
+  ) %>% 
+  
+  # Benchmark to JCT 
   mutate(
     estate_tax_change = estate_tax_change * (jct_estimate / (sum(estate_tax_change * weight * p_inheritance) / 1e9))
-  ) 
+  )
 
 # Write to output
 output_path = file.path(output_root, time_stamp, 'tcja_ext')
