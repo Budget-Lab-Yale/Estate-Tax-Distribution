@@ -6,14 +6,6 @@
 #------------------------------------------------------------------------------
 
 
-# Simulation targets 
-jct_estimate        = -15               # JCT  https://www.cbo.gov/publication/60114
-rev_tcja            = c(36, 42)         # Jan 2025 CBO revenue outlook
-rev_current_law     = c(51, 57)         # Jan 2025 CBO revenue outlook 
-returns_tcja        = c(3000, 5000)     # 2022 SOI filing year taxable stats + 1000
-returns_current_law = c(9000, 12000)    # Assumption: ~2.5x the TCJA level
-
-
 #--------------------
 # Process macro data
 #--------------------
@@ -249,8 +241,8 @@ inheritance_train = scf %>%
 
 # Unweight the data
 inheritance_train = inheritance_train %>% 
-  slice_sample(n = 250000, replace = T, weight_by = weight) %>% 
-  mutate(weight = mean(inheritance_train$weight) * nrow(inheritance_train) / 250000)
+  slice_sample(n = 500000, replace = T, weight_by = weight) %>% 
+  mutate(weight = mean(inheritance_train$weight) * nrow(inheritance_train) / 500000)
 
 
 #-----------------
@@ -264,7 +256,7 @@ if (estimate_qrf) {
     y        = as.factor(inheritance_train$has_inheritance), 
     nthreads = parallel::detectCores(),
     mtry     = 3,
-    nodesize = 25
+    nodesize = 50
   )
   saveRDS(has_inheritance_qrf, './resources/has_inheritance_qrf.RDS')
 } else {
@@ -337,7 +329,8 @@ tax_units = input_data_roots$tax_data %>%
   select(id, weight, age = age1, married, has_kids, income_pctile)
 
 
-# Fit probability of inheritance
+# Fit probability of inheritance and target age-marital status counts in SCF
+# (i.e adjust for scope differences across X variables in data sources)
 inheritance_yhat = tax_units %>%
   mutate(
     p_inheritance = predict(
@@ -345,7 +338,19 @@ inheritance_yhat = tax_units %>%
       newdata = (.),
       what    = function(x) mean(x - 1)
     )
-  )
+  ) %>% 
+  mutate(age_group = floor(age / 5) * 5) %>%
+  left_join(
+    inheritance_train %>% 
+      group_by(married, age_group = floor(age / 5) * 5) %>% 
+      summarise(actual = sum((inheritance > 0) * weight / 4), .groups = 'drop'), 
+    by = c('married', 'age_group')
+  ) %>% 
+  group_by(married, age_group) %>% 
+  mutate(
+    p_inheritance = p_inheritance * (actual / sum(p_inheritance * weight))
+  ) %>% 
+  ungroup()
 
 
 
@@ -395,101 +400,267 @@ fit_inheritances = function(df, seed) {
 }
     
 
+# Fit values
+fit_seed = 8
+inheritance_yhat = inheritance_yhat %>% 
+  fit_inheritances(fit_seed)
 
-do_simulation = function(df, seed, return_microdata = F) {
+
+#---------------------------------------
+# Calibrate to match estate tax targets
+#---------------------------------------
+
+
+calibrate_high_wealth_inheritances = function(df, heirs_per_estate, seed) {
   
-  # Fit inheritances
-  df = fit_inheritances(df, seed)
+  set.seed(seed)
   
-  # Calculate taxes and get totals
-  tax_totals = df %>%
-    expand_grid(
-      count_factor  = c(0.2, 0.25, 0.3),
-      dollar_factor = c(1.5, 2, 2.5),
-      top_factor    = c(3, 3.5, 4),
-      avg_heirs     = seq(1.8, 2.8, 0.2)
-    ) %>%
+  # Estate tax targets
+  wealth_brackets = tibble(
+    min_wealth        = c(5e6, 10e6, 20e6, 50e6),
+    max_wealth        = c(10e6, 20e6, 50e6, Inf),
+    estate_count      = c(3200, 1600, 1200, 500),
+    avg_estate_wealth = c(7.5, 15, 30, 175)
+  )
+  
+  # Convert to inheritance brackets
+  inheritance_brackets = wealth_brackets %>%
     mutate(
-      p_inheritance = p_inheritance * count_factor,
-      gross_estate  = inheritance * avg_heirs,
-      gross_estate  = gross_estate * if_else(gross_estate > 10e6, top_factor, 1),
-      current_law   = pmax(0, gross_estate * dollar_factor - 7.2e6) * 0.4 / avg_heirs, 
-      tcja          = pmax(0, gross_estate * dollar_factor - 14e6)  * 0.4 / avg_heirs
+      min_inheritance        = min_wealth / heirs_per_estate,
+      max_inheritance        = if_else(is.finite(max_wealth), max_wealth / heirs_per_estate, Inf),
+      target_count           = estate_count * heirs_per_estate,
+      target_avg_inheritance = avg_estate_wealth * 1e6 / heirs_per_estate,
+      target_total_wealth    = target_count * target_avg_inheritance
+    )
+  
+  # Copy the input dataframe
+  df_cal = df %>% 
+    mutate(p_inheritance = p_inheritance * if_else(inheritance * heirs_per_estate > 1e6, 0.75, 1))
+  
+  # Process each bracket separately
+  for (i in 1:nrow(inheritance_brackets)) {
+    bracket = inheritance_brackets[i,]
+    
+    # Find records within this bracket
+    idx = which(
+      (df_cal$inheritance >= bracket$min_inheritance) &
+        (df_cal$inheritance < bracket$max_inheritance | is.infinite(bracket$max_inheritance))
+    )
+    
+    # Skip if no records in bracket
+    if (length(idx) == 0) next
+    
+    # Calculate current expected count and wealth
+    current_count = sum(df_cal$p_inheritance[idx] * df_cal$weight[idx])
+    current_wealth = sum(df_cal$p_inheritance[idx] * df_cal$weight[idx] * df_cal$inheritance[idx])
+    
+    # Step 1: Calibrate counts
+    if (current_count < bracket$target_count) {
+      
+      # Calculate simple adjustment factor
+      count_adj_factor = bracket$target_count / current_count
+      
+      # Apply adjustment (capped at 1.0)
+      df_cal$p_inheritance[idx] = pmin(1, df_cal$p_inheritance[idx] * count_adj_factor)
+      
+      # Recalculate after adjustment
+      current_count = sum(df_cal$p_inheritance[idx] * df_cal$weight[idx])
+      current_wealth = sum(df_cal$p_inheritance[idx] * df_cal$weight[idx] * df_cal$inheritance[idx])
+    }
+    
+    # Step 2: Calibrate wealth amounts
+    current_avg_inheritance = current_wealth / current_count
+    if (!is.nan(current_avg_inheritance) && current_avg_inheritance < bracket$target_avg_inheritance) {
+      
+      # Calculate wealth scaling factor
+      wealth_factor = bracket$target_avg_inheritance / current_avg_inheritance
+      
+      # Apply scaling to inheritance values
+      df_cal$inheritance[idx] = df_cal$inheritance[idx] * wealth_factor
+      
+      # Update current wealth
+      current_wealth = sum(df_cal$p_inheritance[idx] * df_cal$weight[idx] * df_cal$inheritance[idx])
+    }
+    
+    # Step 3: If still below target count, promote additional records
+    remaining_deficit = bracket$target_count - current_count
+    
+    if (remaining_deficit > 0) {
+      # Find the highest-income individuals below this bracket
+      below_idx = which(
+        df_cal$inheritance < bracket$min_inheritance &
+          df_cal$inheritance >= quantile(df_cal$inheritance, 0.95)
+      )
+      
+      # Sort by inheritance amount (highest first)
+      below_idx = below_idx[order(df_cal$inheritance[below_idx], decreasing = TRUE)]
+      
+      if (length(below_idx) > 0) {
+        # Select top individuals to "promote" to this bracket
+        max_to_promote = min(length(below_idx), 100)  # Limit how many we promote
+        to_promote = below_idx[1:max_to_promote]
+        
+        # Generate values at or above target average for the bracket
+        alpha = 1.5  # Pareto shape parameter
+        df_cal$inheritance[to_promote] = bracket$target_avg_inheritance * 
+          (1 - runif(length(to_promote)))^(-1/alpha)
+        
+        # Increase their probability based on remaining deficit
+        available_increase = sum((1 - df_cal$p_inheritance[to_promote]) * df_cal$weight[to_promote])
+        
+        if (available_increase > 0) {
+          # Scale factor for increase
+          scale_factor = min(1, remaining_deficit / available_increase)
+          
+          # Apply increase
+          df_cal$p_inheritance[to_promote] = df_cal$p_inheritance[to_promote] +
+            scale_factor * (1 - df_cal$p_inheritance[to_promote])
+        }
+      }
+    }
+  }
+  return(df_cal)
+}
+
+
+
+validate_calibration = function(df, heirs_per_estate) {
+  
+  # Same brackets as in calibration function
+  wealth_brackets = tibble(
+    min_wealth        = c(5e6, 10e6, 20e6, 50e6),
+    max_wealth        = c(10e6, 20e6, 50e6, Inf),
+    estate_count      = c(3200, 1600, 1200, 500),
+    avg_estate_wealth = c(7.5, 15, 30, 175)
+  )
+  
+  # Calculate tax totals
+  df %>% 
+    mutate(
+      gross_estate  = inheritance * heirs_per_estate,
+      current_law   = pmax(0, gross_estate - 7.2e6) * 0.4 / heirs_per_estate, 
+      tcja          = pmax(0, gross_estate - 14e6)  * 0.4 / heirs_per_estate
     ) %>% 
-    group_by(count_factor, dollar_factor, top_factor, avg_heirs) %>% 
+    group_by(
+      gross_estate_group = case_when(
+        gross_estate < 5e6  ~ 1,
+        gross_estate < 10e6 ~ 2,
+        gross_estate < 20e6 ~ 3,
+        gross_estate < 50e6 ~ 4,
+        gross_estate < Inf  ~ 5,
+      )
+    ) %>% 
     summarise(
+      n_inheritances            = sum(p_inheritance * weight), 
+      inheritances              = sum(inheritance * p_inheritance * weight) / 1e9, 
       amount.current_law        = sum(current_law       * p_inheritance * weight) / 1e9, 
       amount.tcja               = sum(tcja              * p_inheritance * weight) / 1e9,
       count_heirs.current_law   = sum((current_law > 0) * p_inheritance * weight), 
       count_heirs.tcja          = sum((tcja > 0)        * p_inheritance * weight), 
-      count_estates.current_law = sum((current_law > 0) * p_inheritance * weight) / mean(avg_heirs), 
-      count_estates.tcja        = sum((tcja > 0)        * p_inheritance * weight) / mean(avg_heirs),
+      count_estates.current_law = sum((current_law > 0) * p_inheritance * weight) / heirs_per_estate, 
+      count_estates.tcja        = sum((tcja > 0)        * p_inheritance * weight) / heirs_per_estate,
       .groups = 'drop'
     ) %>% 
-    bind_rows() 
-  
-  # Calculate status report
-  status = tax_totals %>% 
-    filter(
-      amount.current_law         > rev_current_law[1]     & amount.current_law         < rev_current_law[2]     & 
-      amount.tcja                > rev_tcja[1]            & amount.tcja                < rev_tcja[2]            & 
-      count_estates.current_law  > returns_current_law[1] & count_estates.current_law  < returns_current_law[2] & 
-      count_estates.tcja         > returns_tcja[1]        & count_estates.tcja         < returns_tcja[2]
-    ) %>% 
-    select(count_factor, dollar_factor, top_factor, avg_heirs)
-    
-    return(
-      list(
-        success    = nrow(status) > 0,
-        tax_totals = tax_totals, 
-        status     = status, 
-        microdata  = if (return_microdata) df else NA  
-      )
-    )
+    return()
 }
 
 
-# Do simulations
-sims = map(1:10, ~ do_simulation(inheritance_yhat, .x))
-
-# See whether any were successful
-sims %>% 
-  map(~ .x$success) %>% 
-  unlist() %>% 
-  print()
+# 2.8 avg number of heirs gets us close to CBO/IRS targets
+final_inheritance_values = inheritance_yhat %>% 
+  calibrate_high_wealth_inheritances(heirs_per_estate = 2.8, seed = fit_seed)
 
 
-# Use parameters from 8
-imputed_values = do_simulation(inheritance_yhat, 8, T)$microdata %>% 
-  mutate(
-    p_inheritance       = p_inheritance * 0.2,
-    gross_estate        = inheritance * 2.4,
-    gross_estate        = gross_estate * if_else(gross_estate > 10e6, 4, 1),
-    estate_tax.baseline = pmax(0, gross_estate * 2 - 7.2e6) * 0.4 / 2.4, 
-    estate_tax.reform   = pmax(0, gross_estate * 2 - 14e6)  * 0.4 / 2.4, 
-    estate_tax_change   = estate_tax.reform - estate_tax.baseline
+#----------------------
+# Project data forward
+#----------------------
+
+# Create directories if they don't exist
+dir_baseline = file.path(output_root, time_stamp, 'baseline')
+dir_tcja     = file.path(output_root, time_stamp, 'tcja_ext')
+dir.create(dir_baseline, recursive = TRUE, showWarnings = FALSE)
+dir.create(dir_tcja,     recursive = TRUE, showWarnings = FALSE)
+
+
+# Create projection dataframe with years 2026-2055
+projection_years = 2026:2055
+
+# Extract inflation and nominal growth indexes
+indexes = macro_projections$economic %>%
+  filter(year %in% projection_years) %>% 
+  left_join(
+    macro_projections$demographic %>% 
+      group_by(year) %>% 
+      summarise(population = sum(population, na.rm = T)), 
+    by = 'year'
   ) %>% 
-  
-  # Benchmark to JCT 
   mutate(
-    estate_tax_change = estate_tax_change * (jct_estimate / (sum(estate_tax_change * weight * p_inheritance) / 1e9))
-  )
+    gpp_pc          = gdp / population, 
+    inflation_index = ccpiu_irs / ccpiu_irs[year == 2026], 
+    gdp_pc_index    = gpp_pc / gpp_pc[year == 2026]
+  ) %>% 
+  select(year, ends_with('_index'))
 
-# Write to output
-output_path = file.path(output_root, time_stamp, 'tcja_ext')
-dir.create(output_path, showWarnings = F)
-imputed_values %>% 
-  select(id, p_inheritance, inheritance, estate_tax_change) %>% 
-  write_csv(file.path(output_path, 'estate_tax_detail_2026.csv'))
+# Project estate tax exemption thresholds with chained CPI
+exemptions = indexes %>%
+  mutate(
+    
+    # Base exemption amounts for 2026
+    baseline_exemption = 7.2e6,
+    tcja_ext_exemption = 14e6,
+    
+    # Index exemptions by chained CPI
+    baseline_exemption = baseline_exemption * inflation_index,
+    tcja_ext_exemption = tcja_ext_exemption * inflation_index
+  ) %>% 
+  select(year, baseline_exemption, tcja_ext_exemption)
+
+
+# Function to calculate tax liability and write output files for a given year
+calculate_and_write_for_year = function(year_val) {
   
-
-# Calculate summary stats
-imputed_values %>% 
-  summarise(
-    n_tcja        = sum((estate_tax.reform > 0) * weight * p_inheritance),
-    n_current_law = sum((estate_tax.baseline > 0) * weight * p_inheritance),
-    n_cut         = sum((estate_tax.reform - estate_tax.baseline < 0) * weight * p_inheritance),
-    share_cut     = weighted.mean((estate_tax.reform < estate_tax.baseline) * p_inheritance, weight),
-    avg_chg       = weighted.mean((estate_tax.reform - estate_tax.baseline) * p_inheritance, weight) 
+  # Get growth factors for this year
+  current_gdp_factor         = indexes$gdp_pc_index[indexes$year == year_val]
+  current_baseline_exemption = exemptions$baseline_exemption[exemptions$year == year_val]
+  current_tcja_exemption     = exemptions$tcja_ext_exemption[exemptions$year == year_val]
+  
+  # Scale inheritance values by GDP growth
+  projected_values = final_inheritance_values %>%
+    mutate(
+      
+      # Grow inheritances with per-capita GDP
+      inheritance = inheritance * current_gdp_factor,
+      
+      # Calculate gross estate value
+      gross_estate = inheritance * 2.8,
+      
+      # Calculate tax liability under baseline (current law)
+      baseline_tax = pmax(0, gross_estate - current_baseline_exemption) * 0.4 / 2.8,
+      
+      # Calculate tax liability under TCJA extension
+      tcja_tax = pmax(0, gross_estate - current_tcja_exemption) * 0.4 / 2.8,
+      
+      # Calculate the change in tax liability
+      estate_tax_change = baseline_tax - tcja_tax
+    )
+  
+  # Create baseline output
+  baseline_output = projected_values %>%
+    select(id, p_inheritance, inheritance, estate_tax_liability = baseline_tax)
+  
+  # Create TCJA extension output  
+  tcja_output = projected_values %>%
+    select(id, p_inheritance, inheritance, estate_tax_liability = tcja_tax)
+  
+  # Write output files
+  write_csv(
+    baseline_output,
+    file.path(dir_baseline, paste0('estate_tax_detail_', year_val, '.csv'))
   )
+  write_csv(
+    tcja_output,
+    file.path(dir_tcja, paste0('estate_tax_detail_', year_val, '.csv'))
+  )
+}
+
+
 
