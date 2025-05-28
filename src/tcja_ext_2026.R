@@ -269,7 +269,7 @@ nonzero_inheritance_train = inheritance_train %>%
   filter(inheritance > 0)
 
 # Model mean of log inheritance
-mu_model <- lm(
+mu_model = lm(
   log(inheritance) ~ 
     married + 
     poly(age, 2) + 
@@ -280,7 +280,7 @@ mu_model <- lm(
 
 # Model variance using residuals
 nonzero_inheritance_train$resid_sq = residuals(mu_model)^2
-sigma_model <- lm(
+sigma_model = lm(
   log(resid_sq) ~ 
     married + 
     poly(age, 2) + 
@@ -664,3 +664,27 @@ calculate_and_write_for_year = function(year_val) {
 
 
 
+2026:2055 %>%
+  map(.f = ~ calculate_and_write_for_year(.x))
+
+2026:2055 %>%
+  map(.f = ~ read_csv(paste0('/gpfs/gibbs/project/sarin/shared/model_data/Estate-Tax-Distribution/v1/2025051420/tcja_ext/', 'estate_tax_detail_', .x, '.csv')) %>%
+        mutate(year = .x) %>%
+        group_by(year) %>%
+        reframe(estate = sum(estate_tax_liability) / 1e9)
+      ) %>%
+  bind_rows() %>%
+  write_csv('/gpfs/gibbs/project/sarin/shared/model_data/Estate-Tax-Distribution/v1/2025051420/tcja_ext/revenues.csv')
+
+
+
+base = read_csv('/gpfs/gibbs/project/sarin/shared/model_data/Estate-Tax-Distribution/v1/2025051420/baseline/revenues.csv')
+r15 = read_csv('/gpfs/gibbs/project/sarin/shared/model_data/Estate-Tax-Distribution/v1/2025051420/tcja_ext/revenues.csv') %>%
+  rename(estate2 = estate)
+
+both = base %>% left_join(r15) %>%
+  mutate(delta = estate2 - estate) %>%
+  select(year, delta)
+
+both %>%
+  write_csv('/gpfs/gibbs/project/sarin/shared/model_data/Estate-Tax-Distribution/v1/2025051420/deltas.csv')
