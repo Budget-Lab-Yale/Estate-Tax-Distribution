@@ -1,5 +1,5 @@
 #------------------------------------------------------------------------------
-# tcja_ext_2026.R
+# tcja_ext.R
 #
 # Imputes inheritances and estate tax liability for 2026 current law and TCJA
 # extension scenarios
@@ -662,5 +662,7 @@ calculate_and_write_for_year = function(year_val) {
   )
 }
 
+
+walk(projection_years, calculate_and_write_for_year)
 
 
