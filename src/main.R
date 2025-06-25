@@ -42,5 +42,5 @@ dir.create(file.path(output_root, time_stamp), recursive = T, showWarnings = F)
 # Simulate inheritance and associated tax
 #-----------------------------------------
 
-# source('./src/tcja_ext.R')
+source('./src/tcja_ext.R')
 source('./src/house_obbba.R')

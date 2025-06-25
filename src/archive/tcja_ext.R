@@ -1,11 +1,10 @@
 #------------------------------------------------------------------------------
-# house_obbba.R
+# tcja_ext.R
 #
-# Imputes inheritances and estate tax liability for current law and TCJA
-# extension scenario
+# Imputes inheritances and estate tax liability for 2026 current law and TCJA
+# extension scenarios
 #------------------------------------------------------------------------------
 
-set.seed(123)
 
 #--------------------
 # Process macro data
@@ -527,12 +526,20 @@ calibrate_high_wealth_inheritances = function(df, heirs_per_estate, seed) {
 
 validate_calibration = function(df, heirs_per_estate) {
   
+  # Same brackets as in calibration function
+  wealth_brackets = tibble(
+    min_wealth        = c(5e6, 10e6, 20e6, 50e6),
+    max_wealth        = c(10e6, 20e6, 50e6, Inf),
+    estate_count      = c(3200, 1600, 1200, 500),
+    avg_estate_wealth = c(7.5, 15, 30, 175)
+  )
+  
   # Calculate tax totals
   df %>% 
     mutate(
       gross_estate  = inheritance * heirs_per_estate,
       current_law   = pmax(0, gross_estate - 7.2e6) * 0.4 / heirs_per_estate, 
-      reform        = pmax(0, gross_estate - 15e6)  * 0.4 / heirs_per_estate
+      tcja          = pmax(0, gross_estate - 14e6)  * 0.4 / heirs_per_estate
     ) %>% 
     group_by(
       gross_estate_group = case_when(
@@ -547,11 +554,11 @@ validate_calibration = function(df, heirs_per_estate) {
       n_inheritances            = sum(p_inheritance * weight), 
       inheritances              = sum(inheritance * p_inheritance * weight) / 1e9, 
       amount.current_law        = sum(current_law       * p_inheritance * weight) / 1e9, 
-      amount.reform             = sum(reform            * p_inheritance * weight) / 1e9,
+      amount.tcja               = sum(tcja              * p_inheritance * weight) / 1e9,
       count_heirs.current_law   = sum((current_law > 0) * p_inheritance * weight), 
-      count_heirs.reform        = sum((reform > 0)      * p_inheritance * weight), 
+      count_heirs.tcja          = sum((tcja > 0)        * p_inheritance * weight), 
       count_estates.current_law = sum((current_law > 0) * p_inheritance * weight) / heirs_per_estate, 
-      count_estates.reform      = sum((reform > 0)      * p_inheritance * weight) / heirs_per_estate,
+      count_estates.tcja        = sum((tcja > 0)        * p_inheritance * weight) / heirs_per_estate,
       .groups = 'drop'
     ) %>% 
     return()
@@ -559,9 +566,8 @@ validate_calibration = function(df, heirs_per_estate) {
 
 
 # 2.8 avg number of heirs gets us close to CBO/IRS targets
-heirs_per_estate = 2.8
 final_inheritance_values = inheritance_yhat %>% 
-  calibrate_high_wealth_inheritances(heirs_per_estate = heirs_per_estate, seed = fit_seed)
+  calibrate_high_wealth_inheritances(heirs_per_estate = 2.8, seed = fit_seed)
 
 
 #----------------------
@@ -570,9 +576,10 @@ final_inheritance_values = inheritance_yhat %>%
 
 # Create directories if they don't exist
 dir_baseline = file.path(output_root, time_stamp, 'baseline')
-dir_reform   = file.path(output_root, time_stamp, 'tcja')
+dir_tcja     = file.path(output_root, time_stamp, 'tcja_ext')
 dir.create(dir_baseline, recursive = TRUE, showWarnings = FALSE)
-dir.create(dir_reform,   recursive = TRUE, showWarnings = FALSE)
+dir.create(dir_tcja,     recursive = TRUE, showWarnings = FALSE)
+
 
 # Create projection dataframe with years 2026-2055
 projection_years = 2026:2055
@@ -598,14 +605,14 @@ exemptions = indexes %>%
   mutate(
     
     # Base exemption amounts for 2026
-    baseline_exemption   = 7.2e6,
-    reform_ext_exemption = 14.3e6,
+    baseline_exemption = 7.2e6,
+    tcja_ext_exemption = 14e6,
     
     # Index exemptions by chained CPI
-    baseline_exemption   = baseline_exemption * inflation_index,
-    reform_ext_exemption = reform_ext_exemption * inflation_index
+    baseline_exemption = baseline_exemption * inflation_index,
+    tcja_ext_exemption = tcja_ext_exemption * inflation_index
   ) %>% 
-  select(year, baseline_exemption, reform_ext_exemption)
+  select(year, baseline_exemption, tcja_ext_exemption)
 
 
 # Function to calculate tax liability and write output files for a given year
@@ -614,7 +621,7 @@ calculate_and_write_for_year = function(year_val) {
   # Get growth factors for this year
   current_gdp_factor         = indexes$gdp_pc_index[indexes$year == year_val]
   current_baseline_exemption = exemptions$baseline_exemption[exemptions$year == year_val]
-  current_reform_exemption   = exemptions$reform_ext_exemption[exemptions$year == year_val]
+  current_tcja_exemption     = exemptions$tcja_ext_exemption[exemptions$year == year_val]
   
   # Scale inheritance values by GDP growth
   projected_values = final_inheritance_values %>%
@@ -624,25 +631,25 @@ calculate_and_write_for_year = function(year_val) {
       inheritance = inheritance * current_gdp_factor,
       
       # Calculate gross estate value
-      gross_estate = inheritance * heirs_per_estate,
+      gross_estate = inheritance * 2.8,
       
       # Calculate tax liability under baseline (current law)
-      baseline_tax = pmax(0, gross_estate - current_baseline_exemption) * 0.4 / heirs_per_estate,
+      baseline_tax = pmax(0, gross_estate - current_baseline_exemption) * 0.4 / 2.8,
       
-      # Calculate tax liability under reform
-      reform_tax = pmax(0, gross_estate - current_reform_exemption) * 0.4 / heirs_per_estate,
+      # Calculate tax liability under TCJA extension
+      tcja_tax = pmax(0, gross_estate - current_tcja_exemption) * 0.4 / 2.8,
       
       # Calculate the change in tax liability
-      estate_tax_change = baseline_tax - reform_tax
+      estate_tax_change = baseline_tax - tcja_tax
     )
   
   # Create baseline output
   baseline_output = projected_values %>%
     select(id, p_inheritance, inheritance, estate_tax_liability = baseline_tax)
   
-  # Create reform scenario output  
-  reform_output = projected_values %>%
-    select(id, p_inheritance, inheritance, estate_tax_liability = reform_tax)
+  # Create TCJA extension output  
+  tcja_output = projected_values %>%
+    select(id, p_inheritance, inheritance, estate_tax_liability = tcja_tax)
   
   # Write output files
   write_csv(
@@ -650,8 +657,8 @@ calculate_and_write_for_year = function(year_val) {
     file.path(dir_baseline, paste0('estate_tax_detail_', year_val, '.csv'))
   )
   write_csv(
-    reform_output,
-    file.path(dir_reform, paste0('estate_tax_detail_', year_val, '.csv'))
+    tcja_output,
+    file.path(dir_tcja, paste0('estate_tax_detail_', year_val, '.csv'))
   )
 }
 
