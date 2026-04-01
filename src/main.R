@@ -22,13 +22,13 @@ set.seed(123)
 
 # Global runtime options: data dependency filepaths
 input_data_roots = list(
-  scf               = 'C:/Users/jar335/Documents/Interfaces/raw_data/SCF/v1/',
-  tax_data          = 'C:/Users/jar335/Documents/Interfaces/model_data/Tax-Data/v1/2025060316/baseline',
-  macro_projections = 'C:/Users/jar335/Documents/Interfaces/model_data/Macro-Projections/v3/2025040115/baseline'
+  scf               = '/nfs/roberts/project/pi_nrs36/shared/raw_data/SCF/v1/', 
+  tax_data          = '/nfs/roberts/project/pi_nrs36/shared/model_data/Tax-Data/v1/2024111117/baseline', 
+  macro_projections = '/nfs/roberts/project/pi_nrs36/shared/model_data/Macro-Projections/v3/2024021116/baseline'
 )
 
 # Global runtime options: output filepath
-output_root = 'C:/Users/jar335/Documents/Interfaces/model_data/Estate-Tax-Distribution/v1'
+output_root = '/nfs/roberts/project/pi_nrs36/shared/model_data/Estate-Tax-Distribution/v1'
 
 # Whether to re-estimate random forest model
 estimate_qrf = F
@@ -42,5 +42,4 @@ dir.create(file.path(output_root, time_stamp), recursive = T, showWarnings = F)
 # Simulate inheritance and associated tax
 #-----------------------------------------
 
-source('./src/tcja_ext.R')
-source('./src/house_obbba.R')
+source('./src/tcja_ext_2026.R')

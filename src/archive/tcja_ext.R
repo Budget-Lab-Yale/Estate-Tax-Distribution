@@ -269,7 +269,7 @@ nonzero_inheritance_train = inheritance_train %>%
   filter(inheritance > 0)
 
 # Model mean of log inheritance
-mu_model <- lm(
+mu_model = lm(
   log(inheritance) ~ 
     married + 
     poly(age, 2) + 
@@ -280,7 +280,7 @@ mu_model <- lm(
 
 # Model variance using residuals
 nonzero_inheritance_train$resid_sq = residuals(mu_model)^2
-sigma_model <- lm(
+sigma_model = lm(
   log(resid_sq) ~ 
     married + 
     poly(age, 2) + 
